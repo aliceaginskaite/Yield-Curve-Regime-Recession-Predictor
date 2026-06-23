@@ -1,0 +1,413 @@
+"""
+ regime_detection.py
+
+ What this file does:
+   - Loads spreads built in spreads_construction.py
+   - Prepares features for clustering
+   - Detects yield curve regimes using KMeans clustering
+   - Validates the number of clusters with silhouette score
+   - Labels each cluster by its economic meaning
+   - Plots the spread colored by regime over time
+   - Saves the dataframe with regime column for next scripts
+
+"""
+
+# 1. Imports
+import os
+import warnings
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score
+
+warnings.filterwarnings("ignore")
+
+print("=" * 60)
+print("regime_detection.py - yield curve regimes")
+print("=" * 60)
+
+
+# 2. Paths
+base_dir = os.path.dirname(os.path.abspath(__file__))
+data_dir = os.path.join(base_dir, "data")
+plots_dir = os.path.join(base_dir, "plots")
+os.makedirs(plots_dir, exist_ok=True)
+
+
+# 3. Load spreads
+print("\nLoading spreads...")
+
+spreads = pd.read_csv(
+    os.path.join(data_dir, "spreads.csv"),
+    index_col="Date",
+    parse_dates=True,
+)
+
+recession = pd.read_csv(
+    os.path.join(data_dir, "recession.csv"),
+    index_col="Date",
+    parse_dates=True,
+)
+
+print(f"spreads: {spreads.shape[0]} rows × {spreads.shape[1]} columns")
+print(f"recession: {recession.shape[0]} rows")
+
+"""""
+# 4. Feature matrix
+# We need to describe the shape of the yield curve at each point in time.
+# Using just the raw spread values would work, but adding more features
+# gives the clustering algorithm a richer picture of the curve's state.
+#
+# Features we use:
+#
+#  spread_2y10y - raw 2Y-10Y spread (main shape signal)
+#  spread_3m10y - raw 3M-10Y spread (short-end tension)
+#  spread_2y30y - raw 2Y-30Y spread (full curve slope)
+#  spread_2y10y_ma90 - 90-day smoothed version (trend, not noise)
+#  spread_3m10y_ma90 - same for 3M-10Y
+#  spread_2y30y_ma90 - same for 2Y-30Y
+#  spread_2y10y_diff - daily change in 2Y-10Y (steepening vs flattening)
+#  spread_3m10y_diff - daily change in 3M-10Y
+#
+#
+#   Raw captures current level, smoothed captures the trend direction.
+#   A spread at -0.2 that is trending toward 0 is a different
+#   regime than one at -0.2 and falling.
+"""
+
+feature_cols = [
+    "spread_2y10y",
+    "spread_3m10y",
+    "spread_2y30y",
+    "spread_2y10y_ma90",
+    "spread_3m10y_ma90",
+    "spread_2y30y_ma90",
+    "spread_2y10y_diff",
+    "spread_3m10y_diff",
+]
+
+# drop rows where any feature is nan
+features_raw = spreads[feature_cols].dropna()
+
+print(f"\nFeature matrix:{features_raw.shape[0]} rows × {features_raw.shape[1]} features")
+print(f"Dropped {len(spreads) - len(features_raw)} rows with NaN (MA warmup period)")
+
+"""""
+# 5. Standartize features
+# KMeans uses Euclidean distance to group points.
+# If one feature has values in range [-3, +3] and another in [-0.05, +0.05],
+# the first feature will dominate the distance calculation completely —
+# the algorithm will essentially ignore the small-scale feature.
+#
+# StandardScaler fixes this: transforms each feature to mean=0, std=1.
+# After scaling all features have equal influence on clustering.
+"""""
+
+scaler = StandardScaler()
+features = scaler.fit_transform(features_raw)
+
+print("\nFeatures standardized (mean=0, std=1 per column)")
+
+"""
+# 6. Finding optimal number of clusters
+# We try k = 2, 3, 4, 5, 6 and measure silhouette score for each.
+#
+# Silhouette score measures how well each point fits its own cluster
+# vs how close it is to the nearest other cluster.
+# Range: -1 (bad) to +1 (perfect). Higher = better separation.
+#
+# We expect k=4 to win because yield curves historically have
+# four meaningful shapes: steep, flat, inverted, humped.
+# But we let the data confirm this rather than hardcoding it."""
+
+print("\nSilhouette scores by number of clusters")
+
+k_range = range(2, 7)
+sil_scores = {}
+
+for k in k_range:
+    km = KMeans(n_clusters=k, random_state=42, n_init=20)
+    lbls = km.fit_predict(features)
+    score = silhouette_score(features, lbls, sample_size=5000, random_state=42)
+    sil_scores[k] = score
+    print(f"  k={k} silhouette={score:.4f}")
+
+best_k = max(sil_scores, key=sil_scores.get)
+print(f"\n  Best k = {best_k}  (silhouette = {sil_scores[best_k]:.4f})")
+
+# We use 4 regardless if best_k differs slightly. 4 regimes have clear economic interpretation.
+# If best_k is 4, ok. If it's 3 or 5, we note it but keep 4.
+n_clusters = 4
+if best_k != 4:
+    print(f"Note: best_k={best_k} but using k=4 for economic interpretability")
+else:
+    print(f"Using k=4 - confirmed by silhouette")
+
+"""
+# 7. Fit final kmeans with k=4
+# n_init=50: run KMeans 50 times with different random starting centroids,
+# keep the best result. More runs = more stable clustering.
+# random_state=42: reproducibility — same result every run."""
+
+
+km_final = KMeans(n_clusters=n_clusters, random_state=42, n_init=50)
+cluster_labels = km_final.fit_predict(features)
+
+# attach cluster labels back to original dataframe
+features_raw = features_raw.copy()
+features_raw["cluster"] = cluster_labels
+
+print(f"\nKMeans fitted. Cluster sizes:")
+for c in sorted(features_raw["cluster"].unique()):
+    n = (features_raw["cluster"] == c).sum()
+    pct = n / len(features_raw) * 100
+    print(f"  Cluster {c}: {n} days  ({pct:.1f}%)")
+
+
+"""""
+# 8. Label clustering by econ meaning
+# We look at the centroid of each cluster in original (un-scaled) space
+# and assign a human-readable name based on the spread values.
+#
+# The four yield curve regimes:
+#
+# Steep — 2Y-10Y spread large and positive (>1.5 pp typically)
+#         Normal healthy economy, growth expected, Fed accommodative.
+#         Typically early in economic cycle.
+#
+# Flat — 2Y-10Y spread small positive or near zero (0 to ~1 pp)
+#        Mid-to-late cycle. Market uncertain about growth outlook.
+#        Fed is tightening but hasn't broken anything yet.
+#
+# Inverted — 2Y-10Y spread negative
+#            Short rates above long rates is a recession signal.
+#            Market pricing in rate cuts ahead (i.e. expects recession).
+#            Historically precedes recession by 6-18 months.
+#
+# Humped — Medium 2Y-10Y but large 2Y-30Y, unusual shape
+#          Short and long end both low, middle elevated.
+#          Often transitional (entering or exiting inversion).
+"""""
+
+
+# averaging cluster centroids
+centroids = features_raw.groupby("cluster")[
+    ["spread_2y10y", "spread_3m10y", "spread_2y30y"]
+].mean()
+
+print("\nCluster centroids (original scale, percentage points):")
+print(centroids.round(3).to_string())
+
+# assign labels
+regime_map = {}
+sorted_by_spread = centroids["spread_2y10y"].sort_values()
+
+labels_ordered = sorted_by_spread.index.tolist()
+
+# assign names by rank of 2Y-10Y centroid value
+# Then inspect 2Y-30Y to distinguish flat from humped
+label_names = {}
+for rank, cluster_id in enumerate(labels_ordered):
+    s2y10y = centroids.loc[cluster_id, "spread_2y10y"]
+    s2y30y = centroids.loc[cluster_id, "spread_2y30y"]
+
+    if rank == 0:
+        label_names[cluster_id] = "Inverted"
+    elif rank == len(labels_ordered) - 1:
+        label_names[cluster_id] = "Steep"
+    else:
+        ratio = s2y30y / (abs(s2y10y) + 0.01)
+        if ratio > 2.5:
+            label_names[cluster_id] = "Humped"
+        else:
+            label_names[cluster_id] = "Flat"
+
+
+used_labels = list(label_names.values())
+if used_labels.count("FLAT") == 2:
+    # Assign HUMPED to the one with higher 2Y-30Y
+    middle_ids = labels_ordered[1:-1]
+    higher_2y30y = centroids.loc[middle_ids, "spread_2y30y"].idxmax()
+    label_names[higher_2y30y] = "HUMPED"
+
+print("\nRegime labels assigned:")
+for cluster_id, name in label_names.items():
+    s = centroids.loc[cluster_id, "spread_2y10y"]
+    print(f"  Cluster {cluster_id}  →  {name:<10}  (2Y-10Y centroid = {s:.3f} pp)")
+
+
+features_raw["regime"] = features_raw["cluster"].map(label_names)
+
+# regime distribution
+print("\nRegime distribution:")
+dist = features_raw["regime"].value_counts()
+for regime, count in dist.items():
+    pct = count / len(features_raw) * 100
+    print(f"  {regime:<10}  {count} days  ({pct:.1f}%)")
+
+
+"""# 9. Recession bands helper
+# Same helper we used in file 2 - reused here for plotting."""
+
+recession_daily = recession.reindex(features_raw.index, method="ffill")
+rec_values = recession_daily["recession"]
+rec_starts = rec_values[(rec_values == 1) & (rec_values.shift(1) == 0)].index.tolist()
+rec_ends = rec_values[(rec_values == 0) & (rec_values.shift(1) == 1)].index.tolist()
+if len(rec_starts) > len(rec_ends):
+    rec_ends.append(features_raw.index[-1])
+recession_bands = list(zip(rec_starts, rec_ends))
+
+
+"""# 10. Plot - regime-covered spread over time
+# Two-panel chart:
+# Top panel - 2Y-10Y spread, each day colored by its regime
+# Bottom panel - regime as a colored bar (categorical timeline)
+#
+# This is an important visualization of this project.
+# You can see: which regimes cluster before recessions,
+# how long each regime lasts, and how they transition."""
+
+regime_colors = {
+    "STEEP" : "#16A34A", 
+    "FLAT" : "#F59E0B", 
+    "HUMPED" : "#8B5CF6",  
+    "INVERTED": "#EF4444", 
+}
+
+print("\nBuilding regime chart...")
+
+fig, (ax_top, ax_bot) = plt.subplots(
+    2, 1, figsize=(18, 10),
+    gridspec_kw={"height_ratios": [4, 1]},
+    sharex=True,
+)
+fig.patch.set_facecolor("#FAFAFA")
+
+for ax in (ax_top, ax_bot):
+    ax.set_facecolor("#FAFAFA") 
+
+# top panel: spread line colored by regime 
+
+spread_col = "spread_2y10y"
+
+for regime_name, color in regime_colors.items():
+    mask = features_raw["regime"] == regime_name
+    subset = features_raw[mask]
+    ax_top.scatter(
+        subset.index,
+        subset[spread_col],
+        color=color,
+        s=1.5,
+        alpha=0.6,
+        zorder=2,
+        label=regime_name,
+    )
+
+# overlay 90-day MA in dark for readability
+ax_top.plot(
+    features_raw.index,
+    features_raw["spread_2y10y_ma90"],
+    color="#1E293B",
+    linewidth=1.2,
+    alpha=0.7,
+    zorder=3,
+    label="90-day MA",
+)
+
+ax_top.axhline(0, color="#EF4444", linewidth=1.0, linestyle="--", alpha=0.7, zorder=3)
+
+# recession shading
+for rs, re in recession_bands:
+    ax_top.axvspan(rs, re, color="#D1D5DB", alpha=0.5, zorder=0)
+
+ax_top.set_ylabel("Spread (pp)", fontsize=10)
+ax_top.set_title(
+    "2Y-10Y Yield Spread - colored by yield curve regime",
+    fontsize=13, fontweight="bold", loc="left", pad=8,
+)
+ax_top.grid(axis="y", linestyle=":", linewidth=0.5, alpha=0.5)
+ax_top.spines[["top", "right"]].set_visible(False)
+
+# custom legend
+patches = [
+    mpatches.Patch(color=c, label=f"{r}") for r, c in regime_colors.items()
+]
+patches += [
+    mpatches.Patch(color="#1E293B", alpha=0.7, label="90-day MA"),
+    mpatches.Patch(color="#D1D5DB", alpha=0.6, label="NBER recession"),
+]
+ax_top.legend(handles=patches, loc="upper right", fontsize=8.5, framealpha=0.8)
+
+# bottom panel: regime as categorical color bar
+regime_numeric = features_raw["regime"].map(
+    {"STEEP": 1, "FLAT": 2, "HUMPED": 3, "INVERTED": 4}
+)
+
+for regime_name, color in regime_colors.items():
+    mask = features_raw["regime"] == regime_name
+    ax_bot.fill_between(
+        features_raw.index,
+        0, 1,
+        where=mask,
+        color=color,
+        alpha=0.85,
+        zorder=2,
+    )
+
+for rs, re in recession_bands:
+    ax_bot.axvspan(rs, re, color="#000000", alpha=0.12, zorder=3)
+
+ax_bot.set_yticks([])
+ax_bot.set_ylabel("Regime", fontsize=9)
+ax_bot.set_xlabel("Date", fontsize=10)
+ax_bot.spines[["top", "right", "left"]].set_visible(False)
+
+fig.suptitle(
+    "Yield Curve Regime Detection  (KMeans, k=4) | 1990 - present",
+    fontsize=12, fontweight="bold", y=1,
+)
+
+plt.tight_layout()
+plot_path = os.path.join(plots_dir, "02_regimes.png")
+plt.savefig(plot_path, dpi=150, bbox_inches="tight")
+plt.show()
+print(f"  Chart saved → {plot_path}")
+
+
+"""# 11. Regime transition matrix
+# How often does each regime transition to each other regime
+# This tells us: if Flat usually followed by Inverted?
+# Are there direct Steep -> Inverted transitions?
+#
+# We compute this as a percentage matrix (rows sum to 100%)."""
+
+print("\nRegime transition matrix (row -> column, %)")
+
+regime_series = features_raw["regime"]
+transitions = pd.crosstab(
+    regime_series.shift(1),   
+    regime_series,      
+    normalize="index",
+) * 100
+
+print(transitions.round(1).to_string())
+
+
+""" # 12. Save regime data
+# Merge regime labels back into the full spreads dataframe.
+# Rows without regime (the MA warmup rows at the start) get nan."""
+
+spreads_with_regime = spreads.copy()
+spreads_with_regime["cluster"] = features_raw["cluster"]
+spreads_with_regime["regime"] = features_raw["regime"]
+
+out_path = os.path.join(data_dir, "spreads_with_regime.csv")
+spreads_with_regime.to_csv(out_path)
+print(f"\n  spreads_with_regime.csv saved -> {out_path}")
+
+print("\n" + "=" * 60)
+print("Regimes detected and saved.")
+print("=" * 60)
